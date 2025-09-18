@@ -323,7 +323,8 @@ void writeCheckpoint(secp256k1::uint256 nextKey)
     tmp << "compression=" << getCompressionString(_config.compression) << std::endl;
     tmp << "device=" << _config.device << std::endl;
     tmp << "elapsed=" << (_config.elapsed + util::getSystemTime() - _startTime) << std::endl;
-    tmp << "stride=" << _config.stride.toString();
+    tmp << "stride=" << _config.stride.toString() << std::endl;
+    tmp << "nibble=" << _config.nibble << std::endl;
     tmp.close();
 }
 
@@ -364,6 +365,15 @@ void readCheckpointFile()
     }
     if(entries.find("stride") != entries.end()) {
         _config.stride = util::parseUInt64(entries["stride"].value);
+    }
+    if(entries.find("nibble") != entries.end()) {
+        _config.nibble = util::parseUInt32(entries["nibble"].value);
+
+        if(_config.nibble == 0) {
+            Logger::log(LogLevel::Info, "Nibble filter from checkpoint: disabled");
+        } else {
+            Logger::log(LogLevel::Info, "Nibble filter from checkpoint: " + util::format(_config.nibble));
+        }
     }
 
     _config.totalkeys = (_config.nextKey - _config.startKey).toUint64();
