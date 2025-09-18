@@ -59,6 +59,7 @@ CudaKeySearchDevice::CudaKeySearchDevice(int device, int threads, int pointsPerT
 
     _devPrivateKeys = NULL;
     _nibbleLength = 0;
+    _iterationKeyIncrement = secp256k1::uint256(0);
 }
 
 CudaKeySearchDevice::~CudaKeySearchDevice()
@@ -101,11 +102,13 @@ void CudaKeySearchDevice::init(const secp256k1::uint256 &start, int compression,
     secp256k1::ecpoint p = secp256k1::multiplyPoint(secp256k1::uint256((uint64_t)_threads * _blocks * _pointsPerThread) * _stride, g);
 
     secp256k1::uint256 keyIncrement = secp256k1::uint256((uint64_t)_threads * _blocks * _pointsPerThread) * _stride;
+    _iterationKeyIncrement = keyIncrement;
 
     cudaCall(_resultList.init(sizeof(CudaDeviceResult), 16));
 
     cudaCall(setIncrementorPoint(p.x, p.y));
     cudaCall(setPrivateKeyIncrement(keyIncrement));
+    cudaCall(setIterationOffset(secp256k1::uint256(0)));
 }
 
 
@@ -196,6 +199,11 @@ void CudaKeySearchDevice::setTargets(const std::set<KeySearchTarget> &targets)
 void CudaKeySearchDevice::doStep()
 {
     uint64_t numKeys = (uint64_t)_blocks * _threads * _pointsPerThread;
+
+    if(_devPrivateKeys != NULL) {
+        secp256k1::uint256 iterationOffset = _iterationKeyIncrement.mul(_iterations);
+        cudaCall(setIterationOffset(iterationOffset));
+    }
 
     try {
         if(_iterations < 2 && _startExponent.cmp(numKeys) <= 0) {

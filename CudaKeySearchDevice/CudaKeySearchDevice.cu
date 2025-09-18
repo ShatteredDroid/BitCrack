@@ -27,6 +27,8 @@ __constant__ unsigned int *_PRIVATE_KEYS[1];
 
 __constant__ unsigned int _NIBBLE_LIMIT;
 
+__constant__ unsigned int _ITERATION_OFFSET[8];
+
 static unsigned int *_chainBufferPtr = NULL;
 
 
@@ -99,6 +101,14 @@ cudaError_t setPrivateKeyIncrement(const secp256k1::uint256 &value)
     value.exportWords(words, 8, secp256k1::uint256::BigEndian);
 
     return cudaMemcpyToSymbol(_INC_KEY, words, sizeof(unsigned int) * 8);
+}
+
+cudaError_t setIterationOffset(const secp256k1::uint256 &value)
+{
+    unsigned int words[8];
+    value.exportWords(words, 8, secp256k1::uint256::BigEndian);
+
+    return cudaMemcpyToSymbol(_ITERATION_OFFSET, words, sizeof(unsigned int) * 8);
 }
 
 cudaError_t setPrivateKeyBuffer(unsigned int *ptr)
@@ -225,9 +235,10 @@ __device__ void doIteration(int pointsPerThread, int compression)
         bool skip = false;
 
         if(useNibble) {
-            unsigned int privateKey[8];
-            readInt(privPtr, i, privateKey);
-            skip = hasNibbleSequence(privateKey, nibbleLimit);
+            unsigned int candidateKey[8];
+            readInt(privPtr, i, candidateKey);
+            addUint256(candidateKey, _ITERATION_OFFSET);
+            skip = hasNibbleSequence(candidateKey, nibbleLimit);
         }
 
         readInt(xPtr, i, x);
@@ -272,12 +283,6 @@ __device__ void doIteration(int pointsPerThread, int compression)
         writeInt(xPtr, i, newX);
         writeInt(yPtr, i, newY);
 
-        if(useNibble) {
-            unsigned int privateKey[8];
-            readInt(privPtr, i, privateKey);
-            addUint256(privateKey, _INC_KEY);
-            writeInt(privPtr, i, privateKey);
-        }
     }
 }
 
@@ -297,9 +302,10 @@ __device__ void doIterationWithDouble(int pointsPerThread, int compression)
         bool skip = false;
 
         if(useNibble) {
-            unsigned int privateKey[8];
-            readInt(privPtr, i, privateKey);
-            skip = hasNibbleSequence(privateKey, nibbleLimit);
+            unsigned int candidateKey[8];
+            readInt(privPtr, i, candidateKey);
+            addUint256(candidateKey, _ITERATION_OFFSET);
+            skip = hasNibbleSequence(candidateKey, nibbleLimit);
         }
 
         readInt(xPtr, i, x);
@@ -348,12 +354,6 @@ __device__ void doIterationWithDouble(int pointsPerThread, int compression)
         writeInt(xPtr, i, newX);
         writeInt(yPtr, i, newY);
 
-        if(useNibble) {
-            unsigned int privateKey[8];
-            readInt(privPtr, i, privateKey);
-            addUint256(privateKey, _INC_KEY);
-            writeInt(privPtr, i, privateKey);
-        }
     }
 }
 

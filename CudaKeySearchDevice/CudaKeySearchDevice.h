@@ -64,6 +64,7 @@ private:
     uint32_t getPrivateKeyOffset(int thread, int block, int point);
 
     secp256k1::uint256 _stride;
+    secp256k1::uint256 _iterationKeyIncrement;
 
     bool verifyKey(const secp256k1::uint256 &privateKey, const secp256k1::ecpoint &publicKey, const unsigned int hash[5], bool compressed);
     unsigned int *_devPrivateKeys;
