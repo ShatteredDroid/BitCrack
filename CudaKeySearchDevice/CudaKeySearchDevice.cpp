@@ -56,6 +56,17 @@ CudaKeySearchDevice::CudaKeySearchDevice(int device, int threads, int pointsPerT
     _device = device;
 
     _pointsPerThread = pointsPerThread;
+
+    _devPrivateKeys = NULL;
+    _nibbleLength = 0;
+}
+
+CudaKeySearchDevice::~CudaKeySearchDevice()
+{
+    if(_devPrivateKeys != NULL) {
+        cudaFree(_devPrivateKeys);
+        _devPrivateKeys = NULL;
+    }
 }
 
 void CudaKeySearchDevice::init(const secp256k1::uint256 &start, int compression, const secp256k1::uint256 &stride)
@@ -78,6 +89,9 @@ void CudaKeySearchDevice::init(const secp256k1::uint256 &start, int compression,
     // Use a larger portion of shared memory for L1 cache
     cudaCall(cudaDeviceSetCacheConfig(cudaFuncCachePreferL1));
 
+    cudaCall(setNibbleLimit(_nibbleLength));
+    cudaCall(setPrivateKeyBuffer(NULL));
+
     generateStartingPoints();
 
     cudaCall(allocateChainBuf(_threads * _blocks * _pointsPerThread));
@@ -86,9 +100,12 @@ void CudaKeySearchDevice::init(const secp256k1::uint256 &start, int compression,
     secp256k1::ecpoint g = secp256k1::G();
     secp256k1::ecpoint p = secp256k1::multiplyPoint(secp256k1::uint256((uint64_t)_threads * _blocks * _pointsPerThread) * _stride, g);
 
+    secp256k1::uint256 keyIncrement = secp256k1::uint256((uint64_t)_threads * _blocks * _pointsPerThread) * _stride;
+
     cudaCall(_resultList.init(sizeof(CudaDeviceResult), 16));
 
     cudaCall(setIncrementorPoint(p.x, p.y));
+    cudaCall(setPrivateKeyIncrement(keyIncrement));
 }
 
 
@@ -111,7 +128,41 @@ void CudaKeySearchDevice::generateStartingPoints()
         exponents.push_back(privKey);
     }
 
+    if(_devPrivateKeys != NULL) {
+        cudaFree(_devPrivateKeys);
+        _devPrivateKeys = NULL;
+    }
+
     cudaCall(_deviceKeys.init(_blocks, _threads, _pointsPerThread, exponents));
+
+    if(_nibbleLength > 0) {
+        size_t totalThreadCount = (size_t)_blocks * (size_t)_threads;
+        size_t bufferSize = (size_t)totalPoints * 8;
+
+        std::vector<unsigned int> hostPrivateKeys(bufferSize);
+
+        for(uint64_t idx = 0; idx < totalPoints; idx++) {
+            unsigned int words[8];
+            exponents[(size_t)idx].exportWords(words, 8, secp256k1::uint256::BigEndian);
+
+            uint64_t pointIndex = idx / totalThreadCount;
+            uint64_t threadIndex = idx % totalThreadCount;
+
+            size_t base = (size_t)pointIndex * totalThreadCount * 8;
+            size_t offset = base + (size_t)threadIndex;
+
+            for(int w = 0; w < 8; w++) {
+                hostPrivateKeys[offset] = words[w];
+                offset += totalThreadCount;
+            }
+        }
+
+        cudaCall(cudaMalloc(&_devPrivateKeys, bufferSize * sizeof(unsigned int)));
+        cudaCall(cudaMemcpy(_devPrivateKeys, hostPrivateKeys.data(), bufferSize * sizeof(unsigned int), cudaMemcpyHostToDevice));
+        cudaCall(setPrivateKeyBuffer(_devPrivateKeys));
+    } else {
+        cudaCall(setPrivateKeyBuffer(NULL));
+    }
 
     // Show progress in 10% increments
     double pct = 10.0;
@@ -313,4 +364,9 @@ secp256k1::uint256 CudaKeySearchDevice::getNextKey()
     uint64_t totalPoints = (uint64_t)_pointsPerThread * _threads * _blocks;
 
     return _startExponent + secp256k1::uint256(totalPoints) * _iterations * _stride;
+}
+
+void CudaKeySearchDevice::setNibbleLength(unsigned int nibbleLength)
+{
+    _nibbleLength = nibbleLength;
 }

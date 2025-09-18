@@ -55,6 +55,8 @@ typedef struct {
     secp256k1::uint256 stride = 1;
 
     bool follow = false;
+
+    unsigned int nibble = 0;
 }RunConfig;
 
 static RunConfig _config;
@@ -213,6 +215,7 @@ void usage()
     printf("                          :+COUNT\n");
     printf("                        Where START, END, COUNT are in hex format\n");
     printf("--stride N              Increment by N keys at a time\n");
+    printf("--nibble N             Skip keys containing N identical hex characters in a row\n");
     printf("--share M/N             Divide the keyspace into N equal shares, process the Mth share\n");
     printf("--continue FILE         Save/load progress from FILE\n");
 }
@@ -373,10 +376,27 @@ int run()
         return 1;
     }
 
+#if !defined(BUILD_CUDA)
+    if(_config.nibble > 0) {
+        Logger::log(LogLevel::Error, "--nibble is only supported when CUDA support is enabled");
+        return 1;
+    }
+#else
+    if(_config.nibble > 0 && _devices[_config.device].type != DeviceManager::DeviceType::CUDA) {
+        Logger::log(LogLevel::Error, "--nibble is currently supported only on CUDA devices");
+        return 1;
+    }
+#endif
+
     Logger::log(LogLevel::Info, "Compression: " + getCompressionString(_config.compression));
     Logger::log(LogLevel::Info, "Starting at: " + _config.nextKey.toString());
     Logger::log(LogLevel::Info, "Ending at:   " + _config.endKey.toString());
     Logger::log(LogLevel::Info, "Counting by: " + _config.stride.toString());
+    if(_config.nibble == 0) {
+        Logger::log(LogLevel::Info, "Nibble filter: disabled");
+    } else {
+        Logger::log(LogLevel::Info, "Nibble filter: " + util::format(_config.nibble));
+    }
 
     try {
 
@@ -400,6 +420,12 @@ int run()
 
         // Get device context
         KeySearchDevice *d = getDeviceContext(_devices[_config.device], _config.blocks, _config.threads, _config.pointsPerThread);
+
+#ifdef BUILD_CUDA
+        if(d != NULL && _devices[_config.device].type == DeviceManager::DeviceType::CUDA) {
+            static_cast<CudaKeySearchDevice*>(d)->setNibbleLength(_config.nibble);
+        }
+#endif
 
         KeyFinder f(_config.nextKey, _config.endKey, _config.compression, d, _config.stride);
 
@@ -517,6 +543,7 @@ int main(int argc, char **argv)
     parser.add("", "--continue", true);
     parser.add("", "--share", true);
     parser.add("", "--stride", true);
+    parser.add("", "--nibble", true);
 
     try {
         parser.parse(argc, argv);
@@ -598,6 +625,12 @@ int main(int argc, char **argv)
                 }
 
                 if(_config.stride.cmp(0) == 0) {
+                    throw std::string("argument is out of range");
+                }
+            } else if(optArg.equals("", "--nibble")) {
+                _config.nibble = util::parseUInt32(optArg.arg);
+
+                if(_config.nibble > 64) {
                     throw std::string("argument is out of range");
                 }
             } else if(optArg.equals("-f", "--follow")) {
