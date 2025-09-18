@@ -66,10 +66,13 @@ private:
     secp256k1::uint256 _stride;
 
     bool verifyKey(const secp256k1::uint256 &privateKey, const secp256k1::ecpoint &publicKey, const unsigned int hash[5], bool compressed);
+    unsigned int *_devPrivateKeys;
+    unsigned int _nibbleLength;
 
 public:
 
     CudaKeySearchDevice(int device, int threads, int pointsPerThread, int blocks = 0);
+    ~CudaKeySearchDevice();
 
     virtual void init(const secp256k1::uint256 &start, int compression, const secp256k1::uint256 &stride);
 
@@ -86,6 +89,8 @@ public:
     virtual void getMemoryInfo(uint64_t &freeMem, uint64_t &totalMem);
 
     virtual secp256k1::uint256 getNextKey();
+
+    void setNibbleLength(unsigned int nibbleLength);
 };
 
 #endif

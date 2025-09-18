@@ -21,6 +21,12 @@ __constant__ unsigned int _INC_Y[8];
 
 __constant__ unsigned int *_CHAIN[1];
 
+__constant__ unsigned int _INC_KEY[8];
+
+__constant__ unsigned int *_PRIVATE_KEYS[1];
+
+__constant__ unsigned int _NIBBLE_LIMIT;
+
 static unsigned int *_chainBufferPtr = NULL;
 
 
@@ -87,6 +93,24 @@ cudaError_t setIncrementorPoint(const secp256k1::uint256 &x, const secp256k1::ui
     return cudaMemcpyToSymbol(_INC_Y, yWords, sizeof(unsigned int) * 8);
 }
 
+cudaError_t setPrivateKeyIncrement(const secp256k1::uint256 &value)
+{
+    unsigned int words[8];
+    value.exportWords(words, 8, secp256k1::uint256::BigEndian);
+
+    return cudaMemcpyToSymbol(_INC_KEY, words, sizeof(unsigned int) * 8);
+}
+
+cudaError_t setPrivateKeyBuffer(unsigned int *ptr)
+{
+    return cudaMemcpyToSymbol(_PRIVATE_KEYS, &ptr, sizeof(unsigned int *));
+}
+
+cudaError_t setNibbleLimit(unsigned int nibble)
+{
+    return cudaMemcpyToSymbol(_NIBBLE_LIMIT, &nibble, sizeof(unsigned int));
+}
+
 
 
 __device__ void hashPublicKey(const unsigned int *x, const unsigned int *y, unsigned int *digestOut)
@@ -118,6 +142,54 @@ __device__ void hashPublicKeyCompressed(const unsigned int *x, unsigned int yPar
 }
 
 
+__device__ __forceinline__ void addUint256(unsigned int value[8], const unsigned int addend[8])
+{
+    add_cc(value[7], value[7], addend[7]);
+    addc_cc(value[6], value[6], addend[6]);
+    addc_cc(value[5], value[5], addend[5]);
+    addc_cc(value[4], value[4], addend[4]);
+    addc_cc(value[3], value[3], addend[3]);
+    addc_cc(value[2], value[2], addend[2]);
+    addc_cc(value[1], value[1], addend[1]);
+    addc(value[0], value[0], addend[0]);
+}
+
+__device__ __forceinline__ bool hasNibbleSequence(const unsigned int value[8], unsigned int nibbleLength)
+{
+    if(nibbleLength <= 1) {
+        return false;
+    }
+
+    bool first = true;
+    unsigned int prev = 0;
+    unsigned int count = 0;
+
+    for(int word = 0; word < 8; word++) {
+        unsigned int w = value[word];
+
+        for(int shift = 28; shift >= 0; shift -= 4) {
+            unsigned int nibble = (w >> shift) & 0x0f;
+
+            if(first) {
+                prev = nibble;
+                count = 1;
+                first = false;
+            } else if(nibble == prev) {
+                count++;
+                if(count >= nibbleLength) {
+                    return true;
+                }
+            } else {
+                prev = nibble;
+                count = 1;
+            }
+        }
+    }
+
+    return false;
+}
+
+
 __device__ void setResultFound(int idx, bool compressed, unsigned int x[8], unsigned int y[8], unsigned int digest[5])
 {
     CudaDeviceResult r;
@@ -142,34 +214,46 @@ __device__ void doIteration(int pointsPerThread, int compression)
     unsigned int *chain = _CHAIN[0];
     unsigned int *xPtr = ec::getXPtr();
     unsigned int *yPtr = ec::getYPtr();
+    unsigned int *privPtr = _PRIVATE_KEYS[0];
+    unsigned int nibbleLimit = _NIBBLE_LIMIT;
+    bool useNibble = (nibbleLimit > 0) && (privPtr != NULL);
 
     // Multiply together all (_Gx - x) and then invert
     unsigned int inverse[8] = {0,0,0,0,0,0,0,1};
     for(int i = 0; i < pointsPerThread; i++) {
         unsigned int x[8];
+        bool skip = false;
 
-        unsigned int digest[5];
+        if(useNibble) {
+            unsigned int privateKey[8];
+            readInt(privPtr, i, privateKey);
+            skip = hasNibbleSequence(privateKey, nibbleLimit);
+        }
 
         readInt(xPtr, i, x);
 
-        if(compression == PointCompressionType::UNCOMPRESSED || compression == PointCompressionType::BOTH) {
-            unsigned int y[8];
-            readInt(yPtr, i, y);
+        if(!skip) {
+            unsigned int digest[5];
 
-            hashPublicKey(x, y, digest);
-
-            if(checkHash(digest)) {
-                setResultFound(i, false, x, y, digest);
-            }
-        }
-
-        if(compression == PointCompressionType::COMPRESSED || compression == PointCompressionType::BOTH) {
-            hashPublicKeyCompressed(x, readIntLSW(yPtr, i), digest);
-
-            if(checkHash(digest)) {
+            if(compression == PointCompressionType::UNCOMPRESSED || compression == PointCompressionType::BOTH) {
                 unsigned int y[8];
                 readInt(yPtr, i, y);
-                setResultFound(i, true, x, y, digest);
+
+                hashPublicKey(x, y, digest);
+
+                if(checkHash(digest)) {
+                    setResultFound(i, false, x, y, digest);
+                }
+            }
+
+            if(compression == PointCompressionType::COMPRESSED || compression == PointCompressionType::BOTH) {
+                hashPublicKeyCompressed(x, readIntLSW(yPtr, i), digest);
+
+                if(checkHash(digest)) {
+                    unsigned int y[8];
+                    readInt(yPtr, i, y);
+                    setResultFound(i, true, x, y, digest);
+                }
             }
         }
 
@@ -187,6 +271,13 @@ __device__ void doIteration(int pointsPerThread, int compression)
 
         writeInt(xPtr, i, newX);
         writeInt(yPtr, i, newY);
+
+        if(useNibble) {
+            unsigned int privateKey[8];
+            readInt(privPtr, i, privateKey);
+            addUint256(privateKey, _INC_KEY);
+            writeInt(privPtr, i, privateKey);
+        }
     }
 }
 
@@ -195,38 +286,50 @@ __device__ void doIterationWithDouble(int pointsPerThread, int compression)
     unsigned int *chain = _CHAIN[0];
     unsigned int *xPtr = ec::getXPtr();
     unsigned int *yPtr = ec::getYPtr();
+    unsigned int *privPtr = _PRIVATE_KEYS[0];
+    unsigned int nibbleLimit = _NIBBLE_LIMIT;
+    bool useNibble = (nibbleLimit > 0) && (privPtr != NULL);
 
     // Multiply together all (_Gx - x) and then invert
     unsigned int inverse[8] = {0,0,0,0,0,0,0,1};
     for(int i = 0; i < pointsPerThread; i++) {
         unsigned int x[8];
+        bool skip = false;
 
-        unsigned int digest[5];
+        if(useNibble) {
+            unsigned int privateKey[8];
+            readInt(privPtr, i, privateKey);
+            skip = hasNibbleSequence(privateKey, nibbleLimit);
+        }
 
         readInt(xPtr, i, x);
 
-        // uncompressed
-        if(compression == PointCompressionType::UNCOMPRESSED || compression == PointCompressionType::BOTH) {
-            unsigned int y[8];
-            readInt(yPtr, i, y);
-            hashPublicKey(x, y, digest);
+        if(!skip) {
+            unsigned int digest[5];
 
-            if(checkHash(digest)) {
-                setResultFound(i, false, x, y, digest);
-            }
-        }
-
-        // compressed
-        if(compression == PointCompressionType::COMPRESSED || compression == PointCompressionType::BOTH) {
-
-            hashPublicKeyCompressed(x, readIntLSW(yPtr, i), digest);
-
-            if(checkHash(digest)) {
-
+            // uncompressed
+            if(compression == PointCompressionType::UNCOMPRESSED || compression == PointCompressionType::BOTH) {
                 unsigned int y[8];
                 readInt(yPtr, i, y);
+                hashPublicKey(x, y, digest);
 
-                setResultFound(i, true, x, y, digest);
+                if(checkHash(digest)) {
+                    setResultFound(i, false, x, y, digest);
+                }
+            }
+
+            // compressed
+            if(compression == PointCompressionType::COMPRESSED || compression == PointCompressionType::BOTH) {
+
+                hashPublicKeyCompressed(x, readIntLSW(yPtr, i), digest);
+
+                if(checkHash(digest)) {
+
+                    unsigned int y[8];
+                    readInt(yPtr, i, y);
+
+                    setResultFound(i, true, x, y, digest);
+                }
             }
         }
 
@@ -244,6 +347,13 @@ __device__ void doIterationWithDouble(int pointsPerThread, int compression)
 
         writeInt(xPtr, i, newX);
         writeInt(yPtr, i, newY);
+
+        if(useNibble) {
+            unsigned int privateKey[8];
+            readInt(privPtr, i, privateKey);
+            addUint256(privateKey, _INC_KEY);
+            writeInt(privPtr, i, privateKey);
+        }
     }
 }
 
