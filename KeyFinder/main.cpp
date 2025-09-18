@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <fstream>
 #include <iostream>
+#include <deque>
 
 #include "KeyFinder.h"
 #include "AddressUtil.h"
@@ -19,6 +20,12 @@
 #ifdef BUILD_OPENCL
 #include "CLKeySearchDevice.h"
 #endif
+
+struct KeyspaceEntry {
+    secp256k1::uint256 start;
+    secp256k1::uint256 end;
+    std::string label;
+};
 
 typedef struct {
     // startKey is the first key. We store it so that if the --continue
@@ -45,6 +52,10 @@ typedef struct {
     std::string targetsFile = "";
 
     std::string checkpointFile = "";
+
+    std::string keyspaceFile = "";
+    std::deque<KeyspaceEntry> keyspaceQueue;
+    size_t keyspaceIndex = 0;
 
     int device = 0;
 
@@ -120,7 +131,14 @@ void statusCallback(KeySearchStatus info)
 
 	std::string totalStr = "(" + util::formatThousands(_config.totalkeys + info.total) + " total)";
 
-	std::string timeStr = "[" + util::formatSeconds((unsigned int)((_config.elapsed + info.totalTime) / 1000)) + "]";
+    std::string entryContext = "";
+
+    if(_config.keyspaceQueue.size() > 0 && _config.keyspaceIndex < _config.keyspaceQueue.size()) {
+        entryContext = " {" + util::format((uint64_t)(_config.keyspaceIndex + 1)) + "/"
+            + util::format((uint64_t)_config.keyspaceQueue.size()) + "}";
+    }
+
+    std::string timeStr = "[" + util::formatSeconds((unsigned int)((_config.elapsed + info.totalTime) / 1000)) + "]" + entryContext;
 
 	std::string usedMemStr = util::format((info.deviceMemory - info.freeMemory) /(1024 * 1024));
 
@@ -146,7 +164,14 @@ void statusCallback(KeySearchStatus info)
     if(_config.checkpointFile.length() > 0) {
         uint64_t t = util::getSystemTime();
         if(t - _lastUpdate >= _config.checkpointInterval) {
-            Logger::log(LogLevel::Info, "Checkpoint");
+            std::string checkpointMsg = "Checkpoint";
+
+            if(_config.keyspaceQueue.size() > 0 && _config.keyspaceIndex < _config.keyspaceQueue.size()) {
+                checkpointMsg += " (entry " + util::format((uint64_t)(_config.keyspaceIndex + 1)) + "/"
+                    + util::format((uint64_t)_config.keyspaceQueue.size()) + ")";
+            }
+
+            Logger::log(LogLevel::Info, checkpointMsg);
             writeCheckpoint(info.nextKey);
             _lastUpdate = t;
         }
@@ -189,6 +214,87 @@ bool parseKeyspace(const std::string &s, secp256k1::uint256 &start, secp256k1::u
     return true;
 }
 
+bool loadKeyspaceFile(const std::string &fileName)
+{
+    std::vector<std::string> lines;
+    bool ok = false;
+
+    if(fileName == "-") {
+        ok = util::readLinesFromStream(std::cin, lines);
+    } else {
+        ok = util::readLinesFromStream(fileName, lines);
+    }
+
+    if(!ok) {
+        Logger::log(LogLevel::Error, "Unable to open '" + fileName + "'");
+        return false;
+    }
+
+    _config.keyspaceQueue.clear();
+
+    for(size_t i = 0; i < lines.size(); i++) {
+        std::string raw = util::trim(lines[i]);
+
+        if(raw.length() == 0) {
+            continue;
+        }
+
+        secp256k1::uint256 start;
+        secp256k1::uint256 end;
+
+        try {
+            if(raw.find(':') == std::string::npos) {
+                start = secp256k1::uint256(raw);
+                end = start;
+            } else {
+                parseKeyspace(raw, start, end);
+            }
+        } catch(std::string err) {
+            Logger::log(LogLevel::Error, "Error parsing '" + fileName + "' line " + util::format((uint64_t)(i + 1)) + ": " + err);
+            return false;
+        } catch(...) {
+            Logger::log(LogLevel::Error, "Error parsing '" + fileName + "' line " + util::format((uint64_t)(i + 1)));
+            return false;
+        }
+
+        if(start.cmp(secp256k1::N) > 0) {
+            Logger::log(LogLevel::Error, "Start value out of range on line " + util::format((uint64_t)(i + 1)));
+            return false;
+        }
+
+        if(start.isZero()) {
+            Logger::log(LogLevel::Error, "Start value out of range on line " + util::format((uint64_t)(i + 1)));
+            return false;
+        }
+
+        if(end.cmp(secp256k1::N) > 0) {
+            Logger::log(LogLevel::Error, "End value out of range on line " + util::format((uint64_t)(i + 1)));
+            return false;
+        }
+
+        if(start.cmp(end) > 0) {
+            Logger::log(LogLevel::Error, "Invalid range on line " + util::format((uint64_t)(i + 1)));
+            return false;
+        }
+
+        KeyspaceEntry entry;
+        entry.start = start;
+        entry.end = end;
+        entry.label = raw;
+
+        _config.keyspaceQueue.push_back(entry);
+    }
+
+    if(_config.keyspaceQueue.size() == 0) {
+        Logger::log(LogLevel::Error, "No keyspace entries found in '" + fileName + "'");
+        return false;
+    }
+
+    Logger::log(LogLevel::Info, util::formatThousands((uint64_t)_config.keyspaceQueue.size()) + " keyspace entries loaded from '" + fileName + "'");
+
+    return true;
+}
+
 void usage()
 {
     printf("BitCrack OPTIONS [TARGETS]\n");
@@ -211,9 +317,12 @@ void usage()
     printf("                          START:END\n");
     printf("                          START:+COUNT\n");
     printf("                          START\n");
-    printf("                          :END\n"); 
+    printf("                          :END\n");
     printf("                          :+COUNT\n");
     printf("                        Where START, END, COUNT are in hex format\n");
+    printf("--keyspace-file FILE    Load keyspace ranges from FILE, one per line\n");
+    printf("                        Entries may be single keys or START:END/START:+COUNT\n");
+    printf("                        Incompatible with --keyspace and --share\n");
     printf("--stride N              Increment by N keys at a time\n");
     printf("--nibble N             Skip keys containing N identical hex characters in a row\n");
     printf("--share M/N             Divide the keyspace into N equal shares, process the Mth share\n");
@@ -323,7 +432,17 @@ void writeCheckpoint(secp256k1::uint256 nextKey)
     tmp << "compression=" << getCompressionString(_config.compression) << std::endl;
     tmp << "device=" << _config.device << std::endl;
     tmp << "elapsed=" << (_config.elapsed + util::getSystemTime() - _startTime) << std::endl;
-    tmp << "stride=" << _config.stride.toString();
+    tmp << "stride=" << _config.stride.toString() << std::endl;
+
+    if(_config.keyspaceFile.length() > 0) {
+        tmp << "keyspacefile=" << _config.keyspaceFile << std::endl;
+        tmp << "keyspaceindex=" << (unsigned long long)_config.keyspaceIndex << std::endl;
+
+        if(_config.keyspaceIndex < _config.keyspaceQueue.size()) {
+            tmp << "keyspaceentry=" << _config.keyspaceQueue[_config.keyspaceIndex].label << std::endl;
+        }
+    }
+
     tmp.close();
 }
 
@@ -366,28 +485,25 @@ void readCheckpointFile()
         _config.stride = util::parseUInt64(entries["stride"].value);
     }
 
+    if(entries.find("keyspacefile") != entries.end()) {
+        std::string file = entries["keyspacefile"].value;
+
+        if(_config.keyspaceFile.length() == 0) {
+            _config.keyspaceFile = file;
+        } else if(_config.keyspaceFile != file) {
+            Logger::log(LogLevel::Warning, "Checkpoint references keyspace file '" + file + "'");
+        }
+    }
+
+    if(entries.find("keyspaceindex") != entries.end()) {
+        _config.keyspaceIndex = (size_t)util::parseUInt64(entries["keyspaceindex"].value);
+    }
+
     _config.totalkeys = (_config.nextKey - _config.startKey).toUint64();
 }
 
-int run()
+static int runConfiguredRange()
 {
-    if(_config.device < 0 || _config.device >= _devices.size()) {
-        Logger::log(LogLevel::Error, "device " + util::format(_config.device) + " does not exist");
-        return 1;
-    }
-
-#if !defined(BUILD_CUDA)
-    if(_config.nibble > 0) {
-        Logger::log(LogLevel::Error, "--nibble is only supported when CUDA support is enabled");
-        return 1;
-    }
-#else
-    if(_config.nibble > 0 && _devices[_config.device].type != DeviceManager::DeviceType::CUDA) {
-        Logger::log(LogLevel::Error, "--nibble is currently supported only on CUDA devices");
-        return 1;
-    }
-#endif
-
     Logger::log(LogLevel::Info, "Compression: " + getCompressionString(_config.compression));
     Logger::log(LogLevel::Info, "Starting at: " + _config.nextKey.toString());
     Logger::log(LogLevel::Info, "Ending at:   " + _config.endKey.toString());
@@ -403,7 +519,6 @@ int run()
         _lastUpdate = util::getSystemTime();
         _startTime = util::getSystemTime();
 
-        // Use default parameters if they have not been set
         DeviceParameters params = getDefaultParameters(_devices[_config.device]);
 
         if(_config.blocks == 0) {
@@ -418,7 +533,6 @@ int run()
             _config.pointsPerThread = params.pointsPerThread;
         }
 
-        // Get device context
         KeySearchDevice *d = getDeviceContext(_devices[_config.device], _config.blocks, _config.threads, _config.pointsPerThread);
 
 #ifdef BUILD_CUDA
@@ -442,6 +556,11 @@ int run()
         }
 
         f.run();
+        _config.nextKey = f.getNextKey();
+
+        if(_config.nextKey.cmp(_config.startKey) >= 0) {
+            _config.totalkeys = (_config.nextKey - _config.startKey).toUint64();
+        }
 
         delete d;
     } catch(KeySearchException ex) {
@@ -450,6 +569,70 @@ int run()
     }
 
     return 0;
+}
+
+int run()
+{
+    if(_config.device < 0 || _config.device >= _devices.size()) {
+        Logger::log(LogLevel::Error, "device " + util::format(_config.device) + " does not exist");
+        return 1;
+    }
+
+#if !defined(BUILD_CUDA)
+    if(_config.nibble > 0) {
+        Logger::log(LogLevel::Error, "--nibble is only supported when CUDA support is enabled");
+        return 1;
+    }
+#else
+    if(_config.nibble > 0 && _devices[_config.device].type != DeviceManager::DeviceType::CUDA) {
+        Logger::log(LogLevel::Error, "--nibble is currently supported only on CUDA devices");
+        return 1;
+    }
+#endif
+
+    if(_config.keyspaceQueue.size() > 0) {
+        if(_config.keyspaceIndex >= _config.keyspaceQueue.size()) {
+            Logger::log(LogLevel::Info, "Keyspace file '" + _config.keyspaceFile + "' fully processed");
+            return 0;
+        }
+
+        size_t startIndex = _config.keyspaceIndex;
+
+        for(size_t i = startIndex; i < _config.keyspaceQueue.size(); i++) {
+            _config.keyspaceIndex = i;
+
+            const KeyspaceEntry &entry = _config.keyspaceQueue[i];
+
+            _config.startKey = entry.start;
+
+            if(_config.nextKey.cmp(entry.start) < 0 || _config.nextKey.cmp(entry.end) > 0) {
+                _config.nextKey = entry.start;
+            }
+
+            _config.endKey = entry.end;
+            _config.totalkeys = (_config.nextKey - _config.startKey).toUint64();
+
+            std::string entryMsg = "Processing keyspace entry "
+                + util::format((uint64_t)(i + 1)) + "/" + util::format((uint64_t)_config.keyspaceQueue.size())
+                + ": " + entry.label;
+            Logger::log(LogLevel::Info, entryMsg);
+
+            int rc = runConfiguredRange();
+            if(rc != 0) {
+                return rc;
+            }
+
+            _config.keyspaceIndex = i + 1;
+        }
+
+        if(_config.keyspaceFile.length() > 0) {
+            Logger::log(LogLevel::Info, "Completed keyspace file '" + _config.keyspaceFile + "'");
+        }
+
+        return 0;
+    }
+
+    return runConfiguredRange();
 }
 
 /**
@@ -494,6 +677,7 @@ int main(int argc, char **argv)
     bool optThreads = false;
     bool optBlocks = false;
     bool optPoints = false;
+    bool optKeyspace = false;
 
     uint32_t shareIdx = 0;
     uint32_t numShares = 0;
@@ -540,6 +724,7 @@ int main(int argc, char **argv)
     parser.add("-f", "--follow", false);
     parser.add("", "--list-devices", false);
     parser.add("", "--keyspace", true);
+    parser.add("", "--keyspace-file", true);
     parser.add("", "--continue", true);
     parser.add("", "--share", true);
     parser.add("", "--stride", true);
@@ -585,6 +770,7 @@ int main(int argc, char **argv)
             } else if(optArg.equals("", "--continue")) {
                 _config.checkpointFile = optArg.arg;
             } else if(optArg.equals("", "--keyspace")) {
+                optKeyspace = true;
                 secp256k1::uint256 start;
                 secp256k1::uint256 end;
 
@@ -608,6 +794,8 @@ int main(int argc, char **argv)
                 _config.startKey = start;
                 _config.nextKey = start;
                 _config.endKey = end;
+            } else if(optArg.equals("", "--keyspace-file")) {
+                _config.keyspaceFile = optArg.arg;
             } else if(optArg.equals("", "--share")) {
                 if(!parseShare(optArg.arg, shareIdx, numShares)) {
                     throw std::string("Invalid argument");
@@ -641,11 +829,21 @@ int main(int argc, char **argv)
 			Logger::log(LogLevel::Error, "Error " + opt + ": " + err);
 			return 1;
 		}
-	}
+        }
 
     if(listDevices) {
         printDeviceList(_devices);
         return 0;
+    }
+
+    if(_config.keyspaceFile.length() > 0 && optKeyspace) {
+        Logger::log(LogLevel::Error, "Error: --keyspace-file cannot be combined with --keyspace");
+        return 1;
+    }
+
+    if(_config.keyspaceFile.length() > 0 && optShares) {
+        Logger::log(LogLevel::Error, "Error: --keyspace-file cannot be combined with --share");
+        return 1;
     }
 
 	// Verify device exists
@@ -654,8 +852,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	// Parse operands
-	std::vector<std::string> ops = parser.getOperands();
+    bool checkpointLoaded = false;
+
+        // Parse operands
+        std::vector<std::string> ops = parser.getOperands();
 
     // If there are no operands, then we must be reading from a file, otherwise
     // expect addresses on the commandline
@@ -707,6 +907,40 @@ int main(int argc, char **argv)
 
     if(_config.checkpointFile.length() > 0) {
         readCheckpointFile();
+        checkpointLoaded = true;
+    }
+
+    if(optKeyspace && _config.keyspaceFile.length() > 0) {
+        Logger::log(LogLevel::Error, "Error: --keyspace cannot be combined with a checkpoint that references a keyspace file");
+        return 1;
+    }
+
+    if(_config.keyspaceFile.length() > 0) {
+        if(!loadKeyspaceFile(_config.keyspaceFile)) {
+            return 1;
+        }
+
+        if(_config.keyspaceIndex > _config.keyspaceQueue.size()) {
+            Logger::log(LogLevel::Error, "Checkpoint index is beyond the number of keyspace entries");
+            return 1;
+        }
+
+        if(_config.keyspaceIndex < _config.keyspaceQueue.size()) {
+            const KeyspaceEntry &entry = _config.keyspaceQueue[_config.keyspaceIndex];
+
+            if(_config.startKey.cmp(entry.start) != 0 && checkpointLoaded) {
+                Logger::log(LogLevel::Warning, "Checkpoint start key does not match entry '" + entry.label + "'");
+            }
+
+            _config.startKey = entry.start;
+
+            if(_config.nextKey.cmp(entry.start) < 0 || _config.nextKey.cmp(entry.end) > 0) {
+                _config.nextKey = entry.start;
+            }
+
+            _config.endKey = entry.end;
+            _config.totalkeys = (_config.nextKey - _config.startKey).toUint64();
+        }
     }
 
     return run();
