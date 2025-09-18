@@ -93,6 +93,12 @@ void CudaKeySearchDevice::init(const secp256k1::uint256 &start, int compression,
     cudaCall(setNibbleLimit(_nibbleLength));
     cudaCall(setPrivateKeyBuffer(NULL));
 
+    if(_nibbleLength > 0) {
+        if(!runNibbleSequenceDiagnostics(_nibbleLength)) {
+            Logger::log(LogLevel::Warning, "Nibble filter diagnostics failed");
+        }
+    }
+
     generateStartingPoints();
 
     cudaCall(allocateChainBuf(_threads * _blocks * _pointsPerThread));
