@@ -160,7 +160,7 @@ __device__ __forceinline__ bool hasNibbleSequence(const unsigned int value[8], u
         return false;
     }
 
-    bool first = true;
+    bool started = false;
     unsigned int prev = 0;
     unsigned int count = 0;
 
@@ -170,10 +170,14 @@ __device__ __forceinline__ bool hasNibbleSequence(const unsigned int value[8], u
         for(int shift = 28; shift >= 0; shift -= 4) {
             unsigned int nibble = (w >> shift) & 0x0f;
 
-            if(first) {
+            if(!started) {
+                if(nibble == 0) {
+                    continue;
+                }
+
+                started = true;
                 prev = nibble;
                 count = 1;
-                first = false;
             } else if(nibble == prev) {
                 count++;
                 if(count >= nibbleLength) {
@@ -186,7 +190,170 @@ __device__ __forceinline__ bool hasNibbleSequence(const unsigned int value[8], u
         }
     }
 
+    if(!started) {
+        return true;
+    }
+
     return false;
+}
+
+static bool hostHasNibbleSequence(const unsigned int value[8], unsigned int nibbleLength)
+{
+    if(nibbleLength <= 1) {
+        return false;
+    }
+
+    bool started = false;
+    unsigned int prev = 0;
+    unsigned int count = 0;
+
+    for(int word = 0; word < 8; word++) {
+        unsigned int w = value[word];
+
+        for(int shift = 28; shift >= 0; shift -= 4) {
+            unsigned int nibble = (w >> shift) & 0x0f;
+
+            if(!started) {
+                if(nibble == 0) {
+                    continue;
+                }
+
+                started = true;
+                prev = nibble;
+                count = 1;
+            } else if(nibble == prev) {
+                count++;
+                if(count >= nibbleLength) {
+                    return true;
+                }
+            } else {
+                prev = nibble;
+                count = 1;
+            }
+        }
+    }
+
+    if(!started) {
+        return true;
+    }
+
+    return false;
+}
+
+__global__ void nibbleSequenceDiagnosticKernel(const unsigned int *keys, unsigned int nibbleLength, int keyCount, int *results)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if(idx >= keyCount) {
+        return;
+    }
+
+    const unsigned int *key = keys + idx * 8;
+    results[idx] = hasNibbleSequence(key, nibbleLength) ? 1 : 0;
+}
+
+bool runNibbleSequenceDiagnostics(unsigned int nibbleLength)
+{
+    unsigned int thresholds[3];
+    int thresholdCount = 0;
+
+    auto addThreshold = [&](unsigned int value) {
+        if(value <= 1) {
+            return;
+        }
+
+        for(int i = 0; i < thresholdCount; i++) {
+            if(thresholds[i] == value) {
+                return;
+            }
+        }
+
+        thresholds[thresholdCount++] = value;
+    };
+
+    addThreshold(2);
+    addThreshold(4);
+    addThreshold(nibbleLength);
+
+    if(thresholdCount == 0) {
+        return true;
+    }
+
+    const int keyCount = 4;
+    const unsigned int diagnosticKeys[keyCount][8] = {
+        {0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000},
+        {0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000004, 0xABCDEF13},
+        {0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x44444444, 0x44444444, 0x44444444},
+        {0x44444444, 0x44444444, 0x44444444, 0x44444444, 0x44444444, 0x44444444, 0x44444444, 0x44444444}
+    };
+
+    unsigned int *devKeys = NULL;
+    int *devResults = NULL;
+
+    cudaError_t err = cudaMalloc(&devKeys, sizeof(unsigned int) * 8 * keyCount);
+    if(err != cudaSuccess) {
+        return false;
+    }
+
+    err = cudaMalloc(&devResults, sizeof(int) * keyCount);
+    if(err != cudaSuccess) {
+        cudaFree(devKeys);
+        return false;
+    }
+
+    err = cudaMemcpy(devKeys, diagnosticKeys, sizeof(unsigned int) * 8 * keyCount, cudaMemcpyHostToDevice);
+    if(err != cudaSuccess) {
+        cudaFree(devKeys);
+        cudaFree(devResults);
+        return false;
+    }
+
+    int hostResults[keyCount];
+    bool overallSuccess = true;
+
+    for(int t = 0; t < thresholdCount && overallSuccess; t++) {
+        unsigned int currentThreshold = thresholds[t];
+        int expected[keyCount];
+
+        for(int i = 0; i < keyCount; i++) {
+            expected[i] = hostHasNibbleSequence(diagnosticKeys[i], currentThreshold) ? 1 : 0;
+        }
+
+        int threads = 32;
+        int blocks = (keyCount + threads - 1) / threads;
+
+        nibbleSequenceDiagnosticKernel<<<blocks, threads>>>(devKeys, currentThreshold, keyCount, devResults);
+
+        err = cudaGetLastError();
+        if(err != cudaSuccess) {
+            overallSuccess = false;
+            break;
+        }
+
+        err = cudaDeviceSynchronize();
+        if(err != cudaSuccess) {
+            overallSuccess = false;
+            break;
+        }
+
+        err = cudaMemcpy(hostResults, devResults, sizeof(int) * keyCount, cudaMemcpyDeviceToHost);
+        if(err != cudaSuccess) {
+            overallSuccess = false;
+            break;
+        }
+
+        for(int i = 0; i < keyCount; i++) {
+            if(hostResults[i] != expected[i]) {
+                overallSuccess = false;
+                break;
+            }
+        }
+    }
+
+    cudaFree(devKeys);
+    cudaFree(devResults);
+
+    return overallSuccess;
 }
 
 
