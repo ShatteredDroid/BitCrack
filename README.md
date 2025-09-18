@@ -45,10 +45,16 @@ Options:
 --keyspace KEYSPACE
     Specify the range of keys to search, where KEYSPACE is in the format,
 
-	START:END start at key START, end at key END
-	START:+COUNT start at key START and end at key START + COUNT
+        START:END start at key START, end at key END
+        START:+COUNT start at key START and end at key START + COUNT
     :END start at key 1 and end at key END
-	:+COUNT start at key 1 and end at key 1 + COUNT
+        :+COUNT start at key 1 and end at key 1 + COUNT
+
+--keyspace-file FILE
+    Load key ranges from FILE, one entry per line. Each non-empty line may be
+    a single key or a START:END/START:+COUNT span. Entries are processed in
+    order and the checkpoint file records the current entry index so a run can
+    be resumed. This option cannot be combined with --keyspace or --share.
 
 -c, --compressed
     Search for compressed keys (default). Can be used with -u to also search uncompressed keys
@@ -108,6 +114,11 @@ xxBitCrack.exe --keyspace 80000000:ffffffff 1FshYsUh3mqgsG29XpZ23eLjWV8Ur3VwH
 ...
 GeForce GT 640   224/1024MB | 1 target 10.33 MKey/s (1,357,905,920 total) [00:02:12]
 ```
+
+When using `--keyspace-file`, status updates include the current entry index
+(for example `{2/5}`) so you can track progress through the list. The
+checkpoint file stores the same index; rerun BitCrack with both `--continue`
+and the original keyspace file to resume from that entry.
 
 
 Use the `-b,` `-t` and `-p` options to specify the number of blocks, threads per block, and keys per thread.
