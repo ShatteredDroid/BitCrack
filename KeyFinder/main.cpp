@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <fstream>
 #include <iostream>
+#include <limits>
 
 #include "KeyFinder.h"
 #include "AddressUtil.h"
@@ -452,6 +453,19 @@ int run()
         }
 
         f.run();
+
+        uint64_t now = util::getSystemTime();
+        if(_startTime != 0 && now >= _startTime) {
+            uint64_t elapsed = now - _startTime;
+            uint64_t newElapsed = static_cast<uint64_t>(_config.elapsed) + elapsed;
+            if(newElapsed > std::numeric_limits<unsigned int>::max()) {
+                newElapsed = std::numeric_limits<unsigned int>::max();
+            }
+            _config.elapsed = static_cast<unsigned int>(newElapsed);
+        }
+
+        _startTime = now;
+        _lastUpdate = now;
 
         delete d;
     } catch(KeySearchException ex) {
